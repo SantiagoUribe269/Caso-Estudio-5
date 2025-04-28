@@ -1,7 +1,12 @@
 const { Kafka } = require('kafkajs');
+const express = require('express');
+const bodyParser = require('body-parser');
 const { v4: uuidv4 } = require('uuid');
 
-// Configuración de Kafka
+const app = express();
+app.use(bodyParser.json());
+
+//Configuración de Kafka
 const kafka = new Kafka({
   clientId: 'proveedores-service',
   brokers: ['localhost:9092']
@@ -10,64 +15,129 @@ const kafka = new Kafka({
 const consumer = kafka.consumer({ groupId: 'proveedores-group' });
 const producer = kafka.producer();
 
-// Simulación de base de datos de proveedores
+// "Base de datos" en memoria para el POC
 const proveedoresDB = {
-  'proveedor-A': { stock: 100 },
-  'proveedor-B': { stock: 150 }
+  'proveedor-A': { 
+    id: 'proveedor-A',
+    nombre: 'Proveedor Miami Tech',
+    stock: 100,
+    productos: ['prod-1', 'prod-2'],
+    reservas: []
+  },
+  'proveedor-B': {
+    id: 'proveedor-B',
+    nombre: 'Proveedor Florida Electronics',
+    stock: 150,
+    productos: ['prod-3', 'prod-4'],
+    reservas: []
+  }
 };
 
-async function run() {
-  // Conectar el consumidor y productor
+// "Base de datos" de reservas
+const reservasDB = new Map();
+
+app.use((req, _, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+
+// GET ALL proveedores
+app.get('/proveedores', (_, res) => {
+  res.json(Object.values(proveedoresDB));
+});
+
+// GET proveedores by ID
+app.get('/proveedores/:id', (req, res) => {
+  const proveedor = proveedoresDB[req.params.id];
+  if (!proveedor) {
+    return res.status(404).json({ error: 'Proveedor no encontrado' });
+  }
+  res.json(proveedor);
+});
+
+// patch stock de proveedor
+app.patch('/proveedores/:id/stock', (req, res) => {
+  const proveedor = proveedoresDB[req.params.id];
+  if (!proveedor) {
+    return res.status(404).json({ error: 'Proveedor no encontrado' });
+  }
+
+  const { cantidad } = req.body;
+  if (typeof cantidad !== 'number') {
+    return res.status(400).json({ error: 'Cantidad inválida' });
+  }
+
+  proveedor.stock += cantidad;
+  res.json({
+    mensaje: 'Stock actualizado',
+    nuevoStock: proveedor.stock,
+    proveedorId: proveedor.id
+  });
+});
+
+// get all reservas
+app.get('/reservas', (_, res) => {
+  res.json(Array.from(reservasDB.values()));
+});
+
+// get reservas by id
+app.get('/reservas/:id', (req, res) => {
+  const reserva = reservasDB.get(req.params.id);
+  if (!reserva) {
+    return res.status(404).json({ error: 'Reserva no encontrada' });
+  }
+  res.json(reserva);
+});
+
+async function runKafkaConsumer() {
   await consumer.connect();
   await producer.connect();
   
-  // Suscribirse al topic PedidoCreado
   await consumer.subscribe({ topic: 'PedidoCreado', fromBeginning: true });
 
-  // Procesar mensajes
   await consumer.run({
-    eachMessage: async ({ topic, partition, message }) => {
+    eachMessage: async ({ topic, message }) => {
       if (topic === 'PedidoCreado') {
         const pedido = JSON.parse(message.value.toString());
-        console.log('Procesando reserva de stock para pedido:', pedido.id);
+        console.log('Procesando reserva para pedido:', pedido.id);
         
-        // Simular reserva de stock (elegir proveedor aleatorio)
-        const proveedor = Math.random() > 0.5 ? 'proveedor-A' : 'proveedor-B';
-        const cantidadProductos = pedido.productos.length;
+        const proveedorId = Math.random() > 0.5 ? 'proveedor-A' : 'proveedor-B';
+        const proveedor = proveedoresDB[proveedorId];
+        const cantidadProductos = pedido.productos.reduce((sum, p) => sum + p.cantidad, 0);
         
-        if (proveedoresDB[proveedor].stock >= cantidadProductos) {
-          proveedoresDB[proveedor].stock -= cantidadProductos;
+        if (proveedor.stock >= cantidadProductos) {
+          proveedor.stock -= cantidadProductos;
           
+          const reserva = {
+            id: uuidv4(),
+            pedidoId: pedido.id,
+            proveedorId,
+            cantidad: cantidadProductos,
+            fecha: new Date().toISOString(),
+            estado: 'RESERVADO'
+          };
+          
+          proveedor.reservas.push(reserva.id);
+          reservasDB.set(reserva.id, reserva);
+
+          await producer.send({
+            topic: 'StockReservado',
+            messages: [{ value: JSON.stringify(reserva) }]
+          });
+          
+          console.log('Stock reservado:', reserva);
+        } else {
           const evento = {
             pedidoId: pedido.id,
-            proveedor,
-            cantidad: cantidadProductos,
-            reservaId: uuidv4(),
+            proveedorId,
+            mensaje: 'Stock insuficiente',
             fecha: new Date().toISOString()
           };
           
-          // Publicar evento StockReservado
-          await producer.send({
-            topic: 'StockReservado',
-            messages: [
-              { value: JSON.stringify(evento) }
-            ]
-          });
-          
-          console.log('Stock reservado exitosamente:', evento);
-        } else {
-          // Publicar evento StockInsuficiente
           await producer.send({
             topic: 'StockInsuficiente',
-            messages: [
-              { 
-                value: JSON.stringify({
-                  pedidoId: pedido.id,
-                  proveedor,
-                  mensaje: 'Stock insuficiente'
-                }) 
-              }
-            ]
+            messages: [{ value: JSON.stringify(evento) }]
           });
           
           console.log('Stock insuficiente para pedido:', pedido.id);
@@ -77,4 +147,17 @@ async function run() {
   });
 }
 
-run().catch(console.error);
+// start server
+const PORT = 3001;
+app.listen(PORT, () => {
+  console.log(`Proveedores Service corriendo en http://localhost:${PORT}`);
+  runKafkaConsumer().catch(console.error);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled Rejection:', err);
+});

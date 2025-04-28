@@ -6,7 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 app.use(bodyParser.json());
 
-// Configuración de Kafka
+//Configuración de Kafka
 const kafka = new Kafka({
   clientId: 'pedidos-service',
   brokers: ['localhost:9092']
@@ -14,33 +14,47 @@ const kafka = new Kafka({
 
 const producer = kafka.producer();
 
-// Endpoint para crear pedidos
+// "Base de datos" en memoria para el POC
+const pedidosDB = new Map();
+
+app.use((req, _, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+
+//POST pedido
 app.post('/pedidos', async (req, res) => {
   try {
     const pedido = {
       id: uuidv4(),
       clienteId: req.body.clienteId,
       productos: req.body.productos,
-      fecha: new Date().toISOString()
+      direccionEnvio: req.body.direccionEnvio,
+      fechaCreacion: new Date().toISOString(),
+      estado: 'CREADO'
     };
 
-    // Conectar el productor de Kafka
+    //Validation
+    if (!pedido.clienteId || !pedido.productos || pedido.productos.length === 0) {
+      return res.status(400).json({ error: 'Datos del pedido incompletos' });
+    }
+
+    // save in DB
+    pedidosDB.set(pedido.id, pedido);
+
+    // Publicar evento
     await producer.connect();
-    
-    // Publicar evento PedidoCreado
     await producer.send({
       topic: 'PedidoCreado',
-      messages: [
-        { value: JSON.stringify(pedido) }
-      ]
+      messages: [{ value: JSON.stringify(pedido) }]
     });
-
-    // Desconectar el productor
     await producer.disconnect();
 
     res.status(201).json({
       mensaje: 'Pedido creado exitosamente',
-      pedidoId: pedido.id
+      pedidoId: pedido.id,
+      pedido
     });
   } catch (error) {
     console.error('Error:', error);
@@ -48,8 +62,68 @@ app.post('/pedidos', async (req, res) => {
   }
 });
 
-// Iniciar el servidor
+// GET all pedidos
+app.get('/pedidos', (_, res) => {
+  res.json({
+    total: pedidosDB.size,
+    pedidos: Array.from(pedidosDB.values())
+  });
+});
+
+// get pedido by ID
+app.get('/pedidos/:id', (req, res) => {
+  const pedido = pedidosDB.get(req.params.id);
+  if (!pedido) {
+    return res.status(404).json({ error: 'Pedido no encontrado' });
+  }
+  res.json(pedido);
+});
+
+// PATCH pedido (solo algunos campos)
+app.patch('/pedidos/:id', (req, res) => {
+  const pedido = pedidosDB.get(req.params.id);
+  if (!pedido) {
+    return res.status(404).json({ error: 'Pedido no encontrado' });
+  }
+
+  const updates = req.body;
+  const camposPermitidos = ['direccionEnvio', 'estado'];
+  
+  Object.keys(updates).forEach(key => {
+    if (camposPermitidos.includes(key)) {
+      pedido[key] = updates[key];
+    }
+  });
+
+  pedido.fechaActualizacion = new Date().toISOString();
+  pedidosDB.set(pedido.id, pedido);
+
+  res.json({
+    mensaje: 'Pedido actualizado',
+    pedido
+  });
+});
+
+// delete pedido
+app.delete('/pedidos/:id', (req, res) => {
+  if (!pedidosDB.has(req.params.id)) {
+    return res.status(404).json({ error: 'Pedido no encontrado' });
+  }
+  
+  pedidosDB.delete(req.params.id);
+  res.json({ mensaje: 'Pedido eliminado' });
+});
+
+// start server
 const PORT = 3000;
 app.listen(PORT, () => {
   console.log(`Pedidos Service corriendo en http://localhost:${PORT}`);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled Rejection:', err);
 });
